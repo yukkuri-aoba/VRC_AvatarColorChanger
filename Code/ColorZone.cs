@@ -24,7 +24,7 @@ namespace VRCAvatarColorChanger
         public Rect uvRect = new Rect(0, 0, 1, 1);
 
         // Target
-        public Color targetColor = Color.red;
+        public Color targetColor = Color.white;
 
         // 0 = use target V completely (flat/vivid), 1 = keep original V completely (preserve pattern)
         [Range(0f, 1f)]
