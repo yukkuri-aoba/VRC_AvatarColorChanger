@@ -218,12 +218,10 @@ namespace VRCAvatarColorChanger
             brushSize = EditorGUILayout.IntSlider(Localization.BrushSize, brushSize, 1, 64);
 
             EditorGUILayout.BeginHorizontal();
-            bool newEraseMode = brushEraseMode;
-            if (GUILayout.Toggle(!brushEraseMode, Localization.Exclude, EditorStyles.miniButton))
-                newEraseMode = false;
-            if (GUILayout.Toggle(brushEraseMode, Localization.Include, EditorStyles.miniButton))
-                newEraseMode = true;
-            brushEraseMode = newEraseMode;
+            if (GUILayout.Toggle(!brushEraseMode, Localization.Exclude, EditorStyles.miniButtonLeft) && brushEraseMode)
+                brushEraseMode = false;
+            if (GUILayout.Toggle(brushEraseMode, Localization.Include, EditorStyles.miniButtonRight) && !brushEraseMode)
+                brushEraseMode = true;
             EditorGUILayout.EndHorizontal();
 
             if (GUILayout.Button(Localization.ClearMask))
