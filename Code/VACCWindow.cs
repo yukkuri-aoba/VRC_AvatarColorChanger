@@ -15,6 +15,7 @@ namespace VRCAvatarColorChanger
         private string newFileName = "";
         private float previewZoom = 1f;
         private bool previewDirty = true;
+        private Vector2 previewScrollPos;
 
         // Exclusion mask (full resolution, true = excluded)
         private bool[] exclusionMask;
@@ -22,6 +23,7 @@ namespace VRCAvatarColorChanger
         private int brushSize = 8;
         private bool brushEraseMode; // false = paint exclusion, true = erase exclusion
         private bool isPainting;
+        private Vector2 lastPaintUV = -Vector2.one;
 
         // Mask overlay
         private Texture2D maskOverlayTexture;
@@ -271,7 +273,6 @@ namespace VRCAvatarColorChanger
             }
 
             maskDirty = true;
-            previewDirty = true;
         }
 
         private bool IsExcluded(int x, int y, int texWidth, int texHeight)
@@ -297,10 +298,18 @@ namespace VRCAvatarColorChanger
             if (!IsReadable(sourceTexture))
                 return;
 
+            // Only regenerate during Layout to avoid RenderTexture conflicts during Repaint
             if (previewDirty)
             {
                 GeneratePreview();
                 previewDirty = false;
+            }
+
+            // Rebuild mask overlay separately (lightweight, safe during painting)
+            if (maskDirty && previewTexture != null)
+            {
+                RebuildMaskOverlay(previewTexture.width, previewTexture.height);
+                maskDirty = false;
             }
 
             if (previewTexture == null) return;
@@ -310,14 +319,12 @@ namespace VRCAvatarColorChanger
             float displayW = previewTexture.width * previewZoom;
             float displayH = previewTexture.height * previewZoom;
 
-            // Clamp to available window width so the layout is never stretched
-            float available = EditorGUIUtility.currentViewWidth - 20f;
-            if (displayW > available)
-            {
-                float ratio = available / displayW;
-                displayW = available;
-                displayH *= ratio;
-            }
+            // Cap scroll area so the window stays usable
+            float maxViewH = Mathf.Min(displayH, previewTexture.height) + 16f;
+
+            previewScrollPos = EditorGUILayout.BeginScrollView(
+                previewScrollPos,
+                GUILayout.Height(maxViewH));
 
             var previewRect = GUILayoutUtility.GetRect(
                 displayW, displayH,
@@ -330,8 +337,11 @@ namespace VRCAvatarColorChanger
                 GUI.DrawTexture(previewRect, maskOverlayTexture, ScaleMode.StretchToFill, true);
             }
 
-            // Handle brush painting on preview
-            HandlePreviewInput(previewRect);
+            // Handle brush painting on preview (only when mask section is open)
+            if (maskFoldout)
+                HandlePreviewInput(previewRect);
+
+            EditorGUILayout.EndScrollView();
 
             EditorGUILayout.Space(4);
         }
@@ -351,6 +361,7 @@ namespace VRCAvatarColorChanger
                     {
                         GUIUtility.hotControl = controlId;
                         isPainting = true;
+                        lastPaintUV = -Vector2.one;
                         PaintAtScreenPos(e.mousePosition, previewRect);
                         e.Use();
                     }
@@ -361,6 +372,7 @@ namespace VRCAvatarColorChanger
                     {
                         PaintAtScreenPos(e.mousePosition, previewRect);
                         e.Use();
+                        Repaint();
                     }
                     break;
 
@@ -369,12 +381,17 @@ namespace VRCAvatarColorChanger
                     {
                         GUIUtility.hotControl = 0;
                         isPainting = false;
+                        lastPaintUV = -Vector2.one;
+                        previewDirty = true;
                         e.Use();
+                        Repaint();
                     }
                     break;
 
                 case EventType.Repaint:
-                    if (isInRect)
+                    // ブラシカーソルはペイント中のみ表示
+                    // (ホバー中に表示するとUnity標準スポイトが赤円色を拾うため)
+                    if (isPainting && isInRect)
                     {
                         float brushPixels = brushSize * previewZoom;
                         Handles.color = brushEraseMode
@@ -384,18 +401,37 @@ namespace VRCAvatarColorChanger
                     }
                     break;
             }
-
-            // Only repaint for cursor tracking, not full regeneration
-            if (isInRect && e.type == EventType.MouseMove)
-                Repaint();
         }
 
         private void PaintAtScreenPos(Vector2 screenPos, Rect previewRect)
         {
             float u = (screenPos.x - previewRect.x) / previewRect.width;
             float v = 1f - (screenPos.y - previewRect.y) / previewRect.height; // flip Y
-            if (u < 0 || u > 1 || v < 0 || v > 1) return;
-            PaintMask(new Vector2(u, v));
+            u = Mathf.Clamp01(u);
+            v = Mathf.Clamp01(v);
+
+            var currentUV = new Vector2(u, v);
+
+            // Interpolate between last and current position for continuous strokes
+            if (lastPaintUV.x >= 0f)
+            {
+                float dist = Vector2.Distance(lastPaintUV, currentUV);
+                // Step size in UV space based on brush size relative to mask resolution
+                EnsureMask();
+                float step = (maskWidth > 0) ? 1f / maskWidth : 0.001f;
+                if (dist > step)
+                {
+                    int steps = Mathf.CeilToInt(dist / step);
+                    for (int i = 1; i < steps; i++)
+                    {
+                        Vector2 lerped = Vector2.Lerp(lastPaintUV, currentUV, (float)i / steps);
+                        PaintMask(lerped);
+                    }
+                }
+            }
+
+            PaintMask(currentUV);
+            lastPaintUV = currentUV;
         }
 
         private void GeneratePreview()
@@ -414,12 +450,6 @@ namespace VRCAvatarColorChanger
             int prevW = Mathf.Max(1, Mathf.RoundToInt(srcW * scale));
             int prevH = Mathf.Max(1, Mathf.RoundToInt(srcH * scale));
 
-            // Create scaled copy
-            RenderTexture rt = RenderTexture.GetTemporary(prevW, prevH, 0, RenderTextureFormat.ARGB32);
-            Graphics.Blit(sourceTexture, rt);
-            RenderTexture prev = RenderTexture.active;
-            RenderTexture.active = rt;
-
             if (previewTexture == null || previewTexture.width != prevW || previewTexture.height != prevH)
             {
                 if (previewTexture != null)
@@ -427,9 +457,21 @@ namespace VRCAvatarColorChanger
                 previewTexture = new Texture2D(prevW, prevH, TextureFormat.RGBA32, false);
             }
 
-            previewTexture.ReadPixels(new UnityEngine.Rect(0, 0, prevW, prevH), 0, 0);
-            RenderTexture.active = prev;
-            RenderTexture.ReleaseTemporary(rt);
+            // CPU-based downsampling (avoids RenderTexture which causes black screen in IMGUI)
+            Color32[] srcPixels = sourceTexture.GetPixels32();
+            Color32[] dstPixels = new Color32[prevW * prevH];
+
+            for (int y = 0; y < prevH; y++)
+            {
+                int sy = Mathf.Min(Mathf.FloorToInt(y / scale), srcH - 1);
+                for (int x = 0; x < prevW; x++)
+                {
+                    int sx = Mathf.Min(Mathf.FloorToInt(x / scale), srcW - 1);
+                    dstPixels[y * prevW + x] = srcPixels[sy * srcW + sx];
+                }
+            }
+
+            previewTexture.SetPixels32(dstPixels);
 
             // Process pixels
             ProcessPixels(previewTexture);
