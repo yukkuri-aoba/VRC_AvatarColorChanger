@@ -34,7 +34,7 @@ namespace VRCAvatarColorChanger
         public static string CreditTitle => IsJapanese ? "クレジット" : "Credits";
         public static string CreditBody  => IsJapanese
             ? "VRC AvatarColorChanger (VACC)\n\n制作: yukkuri__aoba\nAI補助: Claude (Anthropic)"
-            : "VRC AvatarColorChanger (VACC)\n\nCreator: yukkuri__aoba\nAI Assistance: Claude (Anthropic)";
+            : "VRC AvatarColorChanger (VACC)\n\nDeveloper: yukkuri__aoba\nAI Assistance: Claude (Anthropic)";
 
         // ─── Source Texture ───
         public static string SourceTexture => IsJapanese ? "元テクスチャ" : "Source Texture";
