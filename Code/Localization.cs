@@ -58,6 +58,21 @@ namespace VRCAvatarColorChanger
         public static string PatternPreserveTooltip => IsJapanese
             ? "0 = 変更先の明度に完全に合わせる（ベタ塗り風）\n1 = 元の明度を完全保持（模様が残りやすい）"
             : "0 = Match target brightness entirely (flat recolor)\n1 = Keep original brightness (preserves patterns)";
+        public static string EdgeSoftness => IsJapanese ? "エッジ柔らかさ" : "Edge Softness";
+        public static string EdgeSoftnessTooltip => IsJapanese
+            ? "0 = 硬いエッジ（従来通り）\n1 = 柔らかいエッジ（アンチエイリアス境界を滑らかに）"
+            : "0 = Hard edge (legacy)\n1 = Soft edge (smooth anti-aliased boundaries)";
+
+        // ─── Processing ───
+        public static string Processing => IsJapanese ? "加工設定" : "Processing";
+        public static string CleanupRadius => IsJapanese ? "ドット除去" : "Dot Cleanup";
+        public static string CleanupRadiusTooltip => IsJapanese
+            ? "メディアンフィルタで孤立ドットを除去します。\n0 = オフ、1〜3 = フィルタ半径"
+            : "Median filter removes isolated dot artifacts.\n0 = off, 1-3 = filter radius";
+        public static string EdgeFeather => IsJapanese ? "エッジぼかし" : "Edge Feather";
+        public static string EdgeFeatherTooltip => IsJapanese
+            ? "選択境界をガウシアンブラーでぼかし、滑らかな遷移を実現します。\n0 = オフ"
+            : "Gaussian blur on selection boundary for smooth transitions.\n0 = off";
 
         // ─── Exclusion Mask ───
         public static string ExclusionMask => IsJapanese ? "除外マスク" : "Exclusion Mask";
@@ -93,6 +108,9 @@ namespace VRCAvatarColorChanger
         public static string TextureReadError => IsJapanese
             ? "テクスチャが読み込めません。Read/Write Enabled を確認してください。"
             : "Cannot read texture. Please check Read/Write Enabled.";
+        public static string TextureLoadError => IsJapanese
+            ? "テクスチャファイルの読み込みに失敗しました。PNG または JPG 形式のファイルを使用してください。"
+            : "Failed to load texture file. Please use a PNG or JPG file.";
         public static string PathNotFound => IsJapanese
             ? "テクスチャのパスが見つかりません。"
             : "Texture path not found.";

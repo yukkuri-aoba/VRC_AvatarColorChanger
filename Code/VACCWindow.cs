@@ -29,8 +29,13 @@ namespace VRCAvatarColorChanger
         private Texture2D maskOverlayTexture;
         private bool maskDirty = true;
 
+        // Processing settings
+        private int cleanupRadius = 1;
+        private float edgeFeather = 0f;
+
         // Foldouts
         private bool zonesFoldout = true;
+        private bool processingFoldout = true;
         private bool maskFoldout = true;
         private bool exportFoldout = true;
 
@@ -53,6 +58,7 @@ namespace VRCAvatarColorChanger
 
             DrawTextureField();
             DrawZoneList();
+            DrawProcessingSection();
             DrawMaskSection();
 
             if (EditorGUI.EndChangeCheck())
@@ -182,6 +188,9 @@ namespace VRCAvatarColorChanger
                     zone.valueBlend = EditorGUILayout.Slider(
                         new GUIContent(Localization.PatternPreserve, Localization.PatternPreserveTooltip),
                         zone.valueBlend, 0f, 1f);
+                    zone.edgeSoftness = EditorGUILayout.Slider(
+                        new GUIContent(Localization.EdgeSoftness, Localization.EdgeSoftnessTooltip),
+                        zone.edgeSoftness, 0f, 1f);
                 }
 
                 EditorGUILayout.EndVertical();
@@ -199,6 +208,28 @@ namespace VRCAvatarColorChanger
                 zones.Add(new ColorZone());
                 previewDirty = true;
             }
+
+            EditorGUILayout.EndFoldoutHeaderGroup();
+            EditorGUILayout.Space(4);
+        }
+
+        // ───────────────────────── Processing Settings ─────────────────────────
+
+        private void DrawProcessingSection()
+        {
+            processingFoldout = EditorGUILayout.BeginFoldoutHeaderGroup(processingFoldout, Localization.Processing);
+            if (!processingFoldout)
+            {
+                EditorGUILayout.EndFoldoutHeaderGroup();
+                return;
+            }
+
+            cleanupRadius = EditorGUILayout.IntSlider(
+                new GUIContent(Localization.CleanupRadius, Localization.CleanupRadiusTooltip),
+                cleanupRadius, 0, 3);
+            edgeFeather = EditorGUILayout.Slider(
+                new GUIContent(Localization.EdgeFeather, Localization.EdgeFeatherTooltip),
+                edgeFeather, 0f, 5f);
 
             EditorGUILayout.EndFoldoutHeaderGroup();
             EditorGUILayout.Space(4);
@@ -455,17 +486,30 @@ namespace VRCAvatarColorChanger
                 previewTexture = new Texture2D(prevW, prevH, TextureFormat.RGBA32, false);
             }
 
-            // CPU-based downsampling (avoids RenderTexture which causes black screen in IMGUI)
+            // CPU-based box-average downsampling (avoids nearest-neighbor aliasing that
+            // produces isolated mismatched pixels and false colour-match dots in the preview).
             Color32[] srcPixels = sourceTexture.GetPixels32();
             Color32[] dstPixels = new Color32[prevW * prevH];
 
             for (int y = 0; y < prevH; y++)
             {
-                int sy = Mathf.Min(Mathf.FloorToInt(y / scale), srcH - 1);
+                int sy0 = Mathf.FloorToInt(y / scale);
+                int sy1 = Mathf.Min(Mathf.FloorToInt((y + 1) / scale), srcH - 1);
                 for (int x = 0; x < prevW; x++)
                 {
-                    int sx = Mathf.Min(Mathf.FloorToInt(x / scale), srcW - 1);
-                    dstPixels[y * prevW + x] = srcPixels[sy * srcW + sx];
+                    int sx0 = Mathf.FloorToInt(x / scale);
+                    int sx1 = Mathf.Min(Mathf.FloorToInt((x + 1) / scale), srcW - 1);
+                    int r = 0, g = 0, b = 0, a = 0, count = 0;
+                    for (int ky = sy0; ky <= sy1; ky++)
+                        for (int kx = sx0; kx <= sx1; kx++)
+                        {
+                            var p = srcPixels[ky * srcW + kx];
+                            r += p.r; g += p.g; b += p.b; a += p.a;
+                            count++;
+                        }
+                    dstPixels[y * prevW + x] = new Color32(
+                        (byte)(r / count), (byte)(g / count),
+                        (byte)(b / count), (byte)(a / count));
                 }
             }
 
@@ -493,42 +537,198 @@ namespace VRCAvatarColorChanger
             Color32[] pixels = tex.GetPixels32();
             int w = tex.width;
             int h = tex.height;
+            int len = w * h;
 
-            for (int i = 0; i < pixels.Length; i++)
+            // Keep original pixels for color matching (unaffected by previous zone recoloring)
+            Color32[] originalPixels = new Color32[len];
+            System.Array.Copy(pixels, originalPixels, len);
+
+            // Process each zone independently with strength-map pipeline
+            for (int z = 0; z < zones.Count; z++)
             {
-                int x = i % w;
-                int y = i / w;
+                var zone = zones[z];
+                if (!zone.enabled) continue;
 
-                // Check exclusion mask
-                if (IsExcluded(x, y, w, h)) continue;
-
-                Color pixel = pixels[i];
-
-                for (int z = zones.Count - 1; z >= 0; z--)
+                // 1. Build strength map using original pixel colors
+                float[] strength = new float[len];
+                for (int i = 0; i < len; i++)
                 {
-                    var zone = zones[z];
-                    if (zone.ContainsPixel(pixel, x, y, w, h))
+                    int x = i % w;
+                    int y = i / w;
+                    if (IsExcluded(x, y, w, h)) continue;
+                    strength[i] = zone.GetMatchStrength(originalPixels[i], x, y, w, h);
+                }
+
+                // 2. Median filter to remove isolated dot artifacts
+                if (cleanupRadius > 0)
+                    strength = MedianFilter(strength, w, h, cleanupRadius);
+
+                // 3. Gaussian blur for smooth edge transitions (constrained to edges)
+                if (edgeFeather > 0.01f)
+                {
+                    float[] preBlur = (float[])strength.Clone();
+                    strength = GaussianBlur(strength, w, h, edgeFeather);
+                    ConstrainBlur(strength, preBlur, w, h, Mathf.CeilToInt(edgeFeather * 2.5f));
+                }
+
+                // 4. Re-apply exclusion mask: blur can spread strength INTO excluded pixels;
+                //    those must never be recoloured regardless of neighbouring matches.
+                if (exclusionMask != null)
+                {
+                    for (int i = 0; i < len; i++)
                     {
-                        pixels[i] = RecolorPixel(pixel, zone.targetColor, zone.valueBlend);
-                        break;
+                        int x = i % w;
+                        int y = i / w;
+                        if (IsExcluded(x, y, w, h)) strength[i] = 0f;
                     }
+                }
+
+                // 5. Apply recoloring blended by strength
+                for (int i = 0; i < len; i++)
+                {
+                    float s = strength[i];
+                    if (s <= 0.001f) continue;
+
+                    Color original = originalPixels[i];
+                    Color32 recolored = RecolorPixel(original, zone.targetColor, zone.sampleColor, zone.valueBlend);
+
+                    if (s >= 0.999f)
+                        pixels[i] = recolored;
+                    else
+                        pixels[i] = Color32.Lerp(pixels[i], recolored, s);
                 }
             }
 
             tex.SetPixels32(pixels);
         }
 
-        private static Color32 RecolorPixel(Color original, Color target, float valueBlend)
+        private static float[] MedianFilter(float[] map, int w, int h, int radius)
+        {
+            float[] result = new float[map.Length];
+            int kernelSize = (2 * radius + 1) * (2 * radius + 1);
+            float[] neighborhood = new float[kernelSize];
+
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    int ki = 0;
+                    for (int dy = -radius; dy <= radius; dy++)
+                    {
+                        for (int dx = -radius; dx <= radius; dx++)
+                        {
+                            int nx = Mathf.Clamp(x + dx, 0, w - 1);
+                            int ny = Mathf.Clamp(y + dy, 0, h - 1);
+                            neighborhood[ki++] = map[ny * w + nx];
+                        }
+                    }
+                    System.Array.Sort(neighborhood, 0, kernelSize);
+                    result[y * w + x] = neighborhood[kernelSize / 2];
+                }
+            }
+
+            return result;
+        }
+
+        private static float[] GaussianBlur(float[] map, int w, int h, float sigma)
+        {
+            int radius = Mathf.CeilToInt(sigma * 2.5f);
+            if (radius < 1) return map;
+
+            // Build 1D kernel
+            float[] kernel = new float[radius * 2 + 1];
+            float sum = 0f;
+            for (int i = -radius; i <= radius; i++)
+            {
+                kernel[i + radius] = Mathf.Exp(-(i * i) / (2f * sigma * sigma));
+                sum += kernel[i + radius];
+            }
+            for (int i = 0; i < kernel.Length; i++)
+                kernel[i] /= sum;
+
+            // Horizontal pass
+            float[] temp = new float[w * h];
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    float val = 0f;
+                    for (int k = -radius; k <= radius; k++)
+                    {
+                        int nx = Mathf.Clamp(x + k, 0, w - 1);
+                        val += map[y * w + nx] * kernel[k + radius];
+                    }
+                    temp[y * w + x] = val;
+                }
+            }
+
+            // Vertical pass
+            float[] result = new float[w * h];
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    float val = 0f;
+                    for (int k = -radius; k <= radius; k++)
+                    {
+                        int ny = Mathf.Clamp(y + k, 0, h - 1);
+                        val += temp[ny * w + x] * kernel[k + radius];
+                    }
+                    result[y * w + x] = val;
+                }
+            }
+
+            return result;
+        }
+
+        private static void ConstrainBlur(float[] blurred, float[] original, int w, int h, int radius)
+        {
+            // Prevent blur from bleeding into areas that had no nearby match.
+            // If neither this pixel nor any neighbor within blur radius had
+            // original strength > 0, zero out the blurred value.
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    int idx = y * w + x;
+                    if (original[idx] > 0f) continue; // was already matched
+
+                    bool hasNearby = false;
+                    int yMin = Mathf.Max(0, y - radius);
+                    int yMax = Mathf.Min(h - 1, y + radius);
+                    int xMin = Mathf.Max(0, x - radius);
+                    int xMax = Mathf.Min(w - 1, x + radius);
+
+                    for (int ny = yMin; ny <= yMax && !hasNearby; ny++)
+                    {
+                        for (int nx = xMin; nx <= xMax && !hasNearby; nx++)
+                        {
+                            if (original[ny * w + nx] > 0f)
+                                hasNearby = true;
+                        }
+                    }
+
+                    if (!hasNearby)
+                        blurred[idx] = 0f;
+                }
+            }
+        }
+
+        private static Color32 RecolorPixel(Color original, Color target, Color sample, float valueBlend)
         {
             float oH, oS, oV;
-            Color.RGBToHSV(original, out oH, out oS, out oV);
-
             float tH, tS, tV;
-            Color.RGBToHSV(target, out tH, out tS, out tV);
+            float sH, sS, sV;
+            Color.RGBToHSV(original, out oH, out oS, out oV);
+            Color.RGBToHSV(target,   out tH, out tS, out tV);
+            Color.RGBToHSV(sample,   out sH, out sS, out sV);
+
+            // Preserve saturation ratio: antialias boundary pixels keep their relative saturation
+            float newS = (sS > 0.001f) ? Mathf.Clamp01(oS * tS / sS) : tS;
 
             float newV = Mathf.Lerp(tV, oV, valueBlend);
 
-            Color result = Color.HSVToRGB(tH, tS, newV);
+            Color result = Color.HSVToRGB(tH, newS, newV);
             result.a = original.a;
             return result;
         }
@@ -579,9 +779,18 @@ namespace VRCAvatarColorChanger
                 return;
             }
 
-            // Full-resolution copy
-            var fullTex = new Texture2D(sourceTexture.width, sourceTexture.height, TextureFormat.RGBA32, false);
-            fullTex.SetPixels32(sourceTexture.GetPixels32());
+            // Load at full original resolution directly from the file on disk,
+            // bypassing Unity's TextureImporter maxTextureSize / compression settings.
+            // (sourceTexture.GetPixels32() returns the *imported* resolution which may be
+            //  scaled down to 2048 or lower depending on importer settings.)
+            byte[] srcBytes = File.ReadAllBytes(srcPath);
+            var fullTex = new Texture2D(2, 2, TextureFormat.RGBA32, false);
+            if (!fullTex.LoadImage(srcBytes))
+            {
+                DestroyImmediate(fullTex);
+                EditorUtility.DisplayDialog(Localization.Error, Localization.TextureLoadError, Localization.OK);
+                return;
+            }
 
             ProcessPixels(fullTex);
             fullTex.Apply();

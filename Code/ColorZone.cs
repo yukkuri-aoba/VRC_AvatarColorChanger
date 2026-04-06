@@ -18,7 +18,7 @@ namespace VRCAvatarColorChanger
 
         // ColorPick mode
         public Color sampleColor = Color.white;
-        public float tolerance = 0.15f;
+        public float tolerance = 0f;
 
         // Rect mode (UV coordinates 0-1)
         public Rect uvRect = new Rect(0, 0, 1, 1);
@@ -30,36 +30,71 @@ namespace VRCAvatarColorChanger
         [Range(0f, 1f)]
         public float valueBlend = 0.85f;
 
-        public bool ContainsPixel(Color pixelColor, int x, int y, int texWidth, int texHeight)
+        // 0 = hard edge, 1 = very soft edge (anti-alias friendly)
+        [Range(0f, 1f)]
+        public float edgeSoftness = 0f;
+
+        /// <summary>
+        /// Returns a match strength in [0, 1] for soft selection.
+        /// 0 = no match, 1 = full match, intermediate = partial (edge/transition).
+        /// </summary>
+        public float GetMatchStrength(Color pixelColor, int x, int y, int texWidth, int texHeight)
         {
-            if (!enabled) return false;
+            if (!enabled) return 0f;
 
             switch (mode)
             {
                 case SelectionMode.ColorPick:
-                    return IsColorMatch(pixelColor);
+                    return GetColorMatchStrength(pixelColor);
                 case SelectionMode.Rect:
-                    return IsInRect(x, y, texWidth, texHeight);
+                    return IsInRect(x, y, texWidth, texHeight) ? 1f : 0f;
                 default:
-                    return false;
+                    return 0f;
             }
         }
 
-        private bool IsColorMatch(Color pixelColor)
+        public bool ContainsPixel(Color pixelColor, int x, int y, int texWidth, int texHeight)
+        {
+            return GetMatchStrength(pixelColor, x, y, texWidth, texHeight) > 0f;
+        }
+
+        private float GetColorMatchStrength(Color pixelColor)
         {
             float pH, pS, pV, sH, sS, sV;
             Color.RGBToHSV(pixelColor, out pH, out pS, out pV);
             Color.RGBToHSV(sampleColor, out sH, out sS, out sV);
 
-            // Hue is circular (0-1), compute shortest distance
+            // Low-saturation pixels have unreliable hue.
+            // Gradual confidence falloff — ramps 0→1 over S=[0.02, 0.10].
+            float satConfidence = Mathf.Clamp01((pS - 0.02f) / 0.08f);
+
+            // Hue distance (circular)
             float hDist = Mathf.Abs(pH - sH);
             if (hDist > 0.5f) hDist = 1f - hDist;
 
+            // Saturation distance (light weight): excludes truly neutral pixels
+            // but allows shadow/highlight variations of the same material.
             float sDist = Mathf.Abs(pS - sS);
-            float vDist = Mathf.Abs(pV - sV);
 
-            float distance = Mathf.Sqrt(hDist * hDist + sDist * sDist + vDist * vDist);
-            return distance <= tolerance;
+            // Value distance intentionally omitted: brightness varies across
+            // shadows and highlights of the same hue, and should all be recoloured.
+            float dist = hDist + sDist * 0.15f;
+
+            if (dist >= tolerance) return 0f;
+
+            // Soft edge: gradual falloff in the outer portion of the tolerance range
+            float softRange = tolerance * edgeSoftness;
+            float hardRange = tolerance - softRange;
+
+            float strength;
+            if (softRange < 0.0001f)
+                strength = 1f; // hard edge mode
+            else if (dist <= hardRange)
+                strength = 1f;
+            else
+                strength = 1f - (dist - hardRange) / softRange;
+
+            return strength * satConfidence;
         }
 
         private bool IsInRect(int x, int y, int texWidth, int texHeight)
