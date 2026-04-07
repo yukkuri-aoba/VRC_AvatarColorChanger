@@ -34,6 +34,9 @@ namespace VRCAvatarColorChanger
         [Range(0f, 1f)]
         public float edgeSoftness = 0f;
 
+        // Layer index: zones in higher layers override lower layers (0 = base layer)
+        public int layerIndex = 0;
+
         /// <summary>
         /// Returns a match strength in [0, 1] for soft selection.
         /// 0 = no match, 1 = full match, intermediate = partial (edge/transition).

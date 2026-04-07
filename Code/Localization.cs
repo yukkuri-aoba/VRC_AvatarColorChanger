@@ -65,10 +65,6 @@ namespace VRCAvatarColorChanger
 
         // ─── Processing ───
         public static string Processing => IsJapanese ? "加工設定" : "Processing";
-        public static string CleanupRadius => IsJapanese ? "ドット除去" : "Dot Cleanup";
-        public static string CleanupRadiusTooltip => IsJapanese
-            ? "メディアンフィルタで孤立ドットを除去します。\n0 = オフ、1〜3 = フィルタ半径"
-            : "Median filter removes isolated dot artifacts.\n0 = off, 1-3 = filter radius";
         public static string EdgeFeather => IsJapanese ? "エッジぼかし" : "Edge Feather";
         public static string EdgeFeatherTooltip => IsJapanese
             ? "選択境界をガウシアンブラーでぼかし、滑らかな遷移を実現します。\n0 = オフ"
@@ -123,5 +119,48 @@ namespace VRCAvatarColorChanger
         public static string Saved(string path) => IsJapanese
             ? $"保存しました:\n{path}"
             : $"Saved:\n{path}";
+
+        // ─── Layer ───
+        public static string LayerIndex => IsJapanese ? "L" : "L";
+
+        // ─── Zoom hint ───
+        public static string ZoomHint => IsJapanese
+            ? "Ctrl+スクロールでもズームできます"
+            : "Ctrl+scroll to zoom";
+
+        // ─── Comparison / Diff ───
+        public static string ComparisonMode => IsJapanese ? "前後比較" : "Compare";
+        public static string DiffMode       => IsJapanese ? "差分表示" : "Diff";
+        public static string Before         => IsJapanese ? "変更前" : "Before";
+        public static string After          => IsJapanese ? "変更後" : "After";
+
+        // ─── Undo mask ───
+        public static string UndoMask => IsJapanese ? "マスクを元に戻す (Ctrl+Z)" : "Undo Mask (Ctrl+Z)";
+
+        // ─── Presets ───
+        public static string Presets              => IsJapanese ? "プリセット" : "Presets";
+        public static string PresetName           => IsJapanese ? "プリセット名" : "Preset Name";
+        public static string SavePreset           => IsJapanese ? "保存" : "Save";
+        public static string LoadPreset           => IsJapanese ? "読込" : "Load";
+        public static string NoPresets            => IsJapanese ? "プリセットがありません" : "No presets saved yet";
+        public static string ExportJson           => IsJapanese ? "JSONエクスポート" : "Export JSON";
+        public static string ImportJson           => IsJapanese ? "JSONインポート" : "Import JSON";
+        public static string PresetStorageProject => IsJapanese ? "プロジェクト内" : "In Project";
+        public static string PresetStorageUser    => IsJapanese ? "ユーザー共通" : "Shared (User)";
+        public static string DeletePresetConfirm(string name) => IsJapanese
+            ? $"プリセット「{name}」を削除しますか？"
+            : $"Delete preset '{name}'?";
+
+        // ─── Batch apply ───
+        public static string BatchApply        => IsJapanese ? "一括適用" : "Batch Apply";
+        public static string BatchHint         => IsJapanese
+            ? "現在のゾーン設定を複数のテクスチャに一括適用します。出力は各ファイル名に _recolored を付与します。"
+            : "Apply current zone settings to multiple textures. Output files are named with _recolored suffix.";
+        public static string AddBatchTexture   => IsJapanese ? "+ テクスチャ追加" : "+ Add Texture";
+        public static string BatchApplyAndSave => IsJapanese ? "一括適用して保存" : "Batch Apply & Save";
+        public static string BatchProgress     => IsJapanese ? "一括適用中..." : "Batch processing...";
+        public static string BatchComplete(int count) => IsJapanese
+            ? $"{count} 件のテクスチャを処理しました"
+            : $"Processed {count} texture(s)";
     }
 }

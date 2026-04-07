@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using UnityEditor;
 using UnityEngine;
 
@@ -30,7 +31,6 @@ namespace VRCAvatarColorChanger
         private bool maskDirty = true;
 
         // Processing settings
-        private int cleanupRadius = 1;
         private float edgeFeather = 0f;
 
         // Foldouts
@@ -42,11 +42,45 @@ namespace VRCAvatarColorChanger
         // Preview generation
         private const int PreviewMaxSize = 512;
 
+        // Phase 2: Before/After comparison
+        private Texture2D rawPreviewTexture;
+        private bool comparisonMode;
+        private bool diffMode;
+        private Texture2D diffTexture;
+
+        // Phase 3: Exclusion mask undo history (max 30 steps)
+        private readonly List<bool[]> _undoMaskHistory = new List<bool[]>();
+        private bool _maskStrokeStarted;
+        private const int UndoMaskLimit = 30;
+
+        // Phase 5: Presets
+        private bool presetsFoldout;
+        private string presetSaveName = "Preset";
+        private bool presetStorageProject = true;
+        private Vector2 presetScrollPos;
+
+        // Phase 7: hotControl-based preview update — fires immediately when slider is released
+
+        // Phase 8: Batch apply
+        private bool batchFoldout;
+        private List<Texture2D> batchTextures = new List<Texture2D>();
+        private Vector2 batchScrollPos;
+
         [MenuItem("Tools/VRC AvatarColorChanger")]
         public static void ShowWindow()
         {
             var window = GetWindow<VACCWindow>(Localization.WindowTitle);
             window.minSize = new Vector2(340, 500);
+        }
+
+        private void OnEnable()
+        {
+            RestoreMaskFromSession();
+        }
+
+        private void OnDisable()
+        {
+            SaveMaskToSession();
         }
 
         private void OnGUI()
@@ -66,7 +100,9 @@ namespace VRCAvatarColorChanger
                 previewDirty = true;
             }
 
+            DrawPresetsSection();
             DrawPreview();
+            DrawBatchSection();
             DrawExportSection();
 
             EditorGUILayout.EndScrollView();
@@ -109,14 +145,17 @@ namespace VRCAvatarColorChanger
                 Localization.Texture, sourceTexture, typeof(Texture2D), false);
             if (newTex != sourceTexture)
             {
+                SaveMaskToSession();                         // persist mask for old texture
                 sourceTexture = newTex;
                 previewDirty = true;
                 exclusionMask = null;
+                _undoMaskHistory.Clear();
                 if (sourceTexture != null)
                 {
                     var path = AssetDatabase.GetAssetPath(sourceTexture);
                     newFileName = Path.GetFileNameWithoutExtension(path) + "_recolored";
                 }
+                RestoreMaskFromSession();                    // load mask for new texture
             }
 
             if (sourceTexture != null && !IsReadable(sourceTexture))
@@ -153,6 +192,8 @@ namespace VRCAvatarColorChanger
                 EditorGUILayout.BeginHorizontal();
                 zone.enabled = EditorGUILayout.ToggleLeft("", zone.enabled, GUILayout.Width(16));
                 zone.name = EditorGUILayout.TextField(zone.name);
+                EditorGUILayout.LabelField(Localization.LayerIndex, GUILayout.Width(14));
+                zone.layerIndex = Mathf.Max(0, EditorGUILayout.IntField(zone.layerIndex, GUILayout.Width(30)));
                 if (GUILayout.Button("×", GUILayout.Width(22)))
                 {
                     removeIndex = i;
@@ -224,9 +265,6 @@ namespace VRCAvatarColorChanger
                 return;
             }
 
-            cleanupRadius = EditorGUILayout.IntSlider(
-                new GUIContent(Localization.CleanupRadius, Localization.CleanupRadiusTooltip),
-                cleanupRadius, 0, 3);
             edgeFeather = EditorGUILayout.Slider(
                 new GUIContent(Localization.EdgeFeather, Localization.EdgeFeatherTooltip),
                 edgeFeather, 0f, 5f);
@@ -257,9 +295,15 @@ namespace VRCAvatarColorChanger
 
             if (GUILayout.Button(Localization.ClearMask))
             {
+                PushMaskUndo();
                 exclusionMask = null;
                 previewDirty = true;
             }
+
+            EditorGUI.BeginDisabledGroup(_undoMaskHistory.Count == 0);
+            if (GUILayout.Button(Localization.UndoMask))
+                UndoMaskStep();
+            EditorGUI.EndDisabledGroup();
 
             EditorGUILayout.HelpBox(Localization.MaskHint, MessageType.Info);
 
@@ -327,11 +371,16 @@ namespace VRCAvatarColorChanger
             if (!IsReadable(sourceTexture))
                 return;
 
-            // Only regenerate during Layout to avoid RenderTexture conflicts during Repaint
-            if (previewDirty)
+            // hotControl-based update: only regenerate when no control is being dragged
+            // (i.e. the user has released the mouse from a slider)
+            if (previewDirty && GUIUtility.hotControl == 0)
             {
                 GeneratePreview();
                 previewDirty = false;
+            }
+            else if (previewDirty)
+            {
+                Repaint(); // keep polling until slider is released
             }
 
             // Rebuild mask overlay separately (lightweight, safe during painting)
@@ -343,32 +392,76 @@ namespace VRCAvatarColorChanger
 
             if (previewTexture == null) return;
 
-            previewZoom = EditorGUILayout.Slider(Localization.Zoom, previewZoom, 0.25f, 4f);
+            // Zoom slider + comparison/diff toggles
+            previewZoom = EditorGUILayout.Slider(
+                new GUIContent(Localization.Zoom, Localization.ZoomHint),
+                previewZoom, 0.25f, 4f);
 
-            float displayW = previewTexture.width * previewZoom;
+            EditorGUILayout.BeginHorizontal();
+            if (GUILayout.Toggle(comparisonMode, Localization.ComparisonMode, EditorStyles.miniButtonLeft) != comparisonMode)
+            {
+                comparisonMode = !comparisonMode;
+                if (comparisonMode) diffMode = false;
+            }
+            if (GUILayout.Toggle(diffMode, Localization.DiffMode, EditorStyles.miniButtonRight) != diffMode)
+            {
+                diffMode = !diffMode;
+                if (diffMode) comparisonMode = false;
+            }
+            EditorGUILayout.EndHorizontal();
+
+            float displayW = previewTexture.width  * previewZoom;
             float displayH = previewTexture.height * previewZoom;
 
-            // Cap scroll area so the window stays usable
             float maxViewH = Mathf.Min(displayH, previewTexture.height) + 16f;
 
             previewScrollPos = EditorGUILayout.BeginScrollView(
                 previewScrollPos,
                 GUILayout.Height(maxViewH));
 
-            var previewRect = GUILayoutUtility.GetRect(
-                displayW, displayH,
-                GUILayout.Width(displayW), GUILayout.Height(displayH));
-            EditorGUI.DrawPreviewTexture(previewRect, previewTexture);
+            Rect activePreviewRect = default;
 
-            // Draw mask overlay
-            if (maskOverlayTexture != null)
+            if (comparisonMode && rawPreviewTexture != null)
             {
-                GUI.DrawTexture(previewRect, maskOverlayTexture, ScaleMode.StretchToFill, true);
+                EditorGUILayout.BeginHorizontal();
+
+                // Before panel
+                EditorGUILayout.BeginVertical(GUILayout.Width(displayW));
+                EditorGUILayout.LabelField(Localization.Before, GUILayout.Width(displayW));
+                var rawRect = GUILayoutUtility.GetRect(displayW, displayH,
+                    GUILayout.Width(displayW), GUILayout.Height(displayH));
+                EditorGUI.DrawPreviewTexture(rawRect, rawPreviewTexture);
+                EditorGUILayout.EndVertical();
+
+                GUILayout.Space(8);
+
+                // After panel
+                EditorGUILayout.BeginVertical(GUILayout.Width(displayW));
+                EditorGUILayout.LabelField(Localization.After, GUILayout.Width(displayW));
+                activePreviewRect = GUILayoutUtility.GetRect(displayW, displayH,
+                    GUILayout.Width(displayW), GUILayout.Height(displayH));
+                EditorGUI.DrawPreviewTexture(activePreviewRect, previewTexture);
+                if (maskOverlayTexture != null)
+                    GUI.DrawTexture(activePreviewRect, maskOverlayTexture, ScaleMode.StretchToFill, true);
+                EditorGUILayout.EndVertical();
+
+                EditorGUILayout.EndHorizontal();
+            }
+            else
+            {
+                activePreviewRect = GUILayoutUtility.GetRect(displayW, displayH,
+                    GUILayout.Width(displayW), GUILayout.Height(displayH));
+                EditorGUI.DrawPreviewTexture(activePreviewRect, previewTexture);
+
+                if (diffMode && diffTexture != null)
+                    GUI.DrawTexture(activePreviewRect, diffTexture, ScaleMode.StretchToFill, true);
+                else if (maskOverlayTexture != null)
+                    GUI.DrawTexture(activePreviewRect, maskOverlayTexture, ScaleMode.StretchToFill, true);
             }
 
-            // Handle brush painting on preview (only when mask section is open)
+            // Handle brush / wand input on the active (After) panel
             if (maskFoldout)
-                HandlePreviewInput(previewRect);
+                HandlePreviewInput(activePreviewRect);
 
             EditorGUILayout.EndScrollView();
 
@@ -385,11 +478,29 @@ namespace VRCAvatarColorChanger
 
             switch (e.GetTypeForControl(controlId))
             {
+                case EventType.ScrollWheel:
+                    if (isInRect && e.control)
+                    {
+                        previewZoom = Mathf.Clamp(previewZoom - e.delta.y * 0.05f, 0.25f, 4f);
+                        e.Use();
+                        Repaint();
+                    }
+                    break;
+
+                case EventType.KeyDown:
+                    if (e.control && e.keyCode == KeyCode.Z && !isPainting)
+                    {
+                        UndoMaskStep();
+                        e.Use();
+                    }
+                    break;
+
                 case EventType.MouseDown:
                     if (e.button == 0 && isInRect)
                     {
                         GUIUtility.hotControl = controlId;
                         isPainting = true;
+                        _maskStrokeStarted = false;
                         lastPaintUV = -Vector2.one;
                         PaintAtScreenPos(e.mousePosition, previewRect);
                         e.Use();
@@ -410,6 +521,7 @@ namespace VRCAvatarColorChanger
                     {
                         GUIUtility.hotControl = 0;
                         isPainting = false;
+                        _maskStrokeStarted = false;
                         lastPaintUV = -Vector2.one;
                         previewDirty = true;
                         e.Use();
@@ -434,6 +546,13 @@ namespace VRCAvatarColorChanger
 
         private void PaintAtScreenPos(Vector2 screenPos, Rect previewRect)
         {
+            // Push undo state once at the start of each new brush stroke
+            if (!_maskStrokeStarted)
+            {
+                PushMaskUndo();
+                _maskStrokeStarted = true;
+            }
+
             float u = (screenPos.x - previewRect.x) / previewRect.width;
             float v = 1f - (screenPos.y - previewRect.y) / previewRect.height; // flip Y
             u = Mathf.Clamp01(u);
@@ -513,11 +632,23 @@ namespace VRCAvatarColorChanger
                 }
             }
 
+            // Save raw (unprocessed) preview for Before/After comparison
+            if (rawPreviewTexture == null || rawPreviewTexture.width != prevW || rawPreviewTexture.height != prevH)
+            {
+                if (rawPreviewTexture != null) DestroyImmediate(rawPreviewTexture);
+                rawPreviewTexture = new Texture2D(prevW, prevH, TextureFormat.RGBA32, false);
+            }
+            rawPreviewTexture.SetPixels32(dstPixels);
+            rawPreviewTexture.Apply();
+
             previewTexture.SetPixels32(dstPixels);
 
             // Process pixels
             ProcessPixels(previewTexture);
             previewTexture.Apply();
+
+            // Build diff texture for diff mode
+            BuildDiffTexture(rawPreviewTexture, previewTexture);
 
             // Rebuild mask overlay if needed
             if (maskDirty || maskOverlayTexture == null ||
@@ -543,11 +674,24 @@ namespace VRCAvatarColorChanger
             Color32[] originalPixels = new Color32[len];
             System.Array.Copy(pixels, originalPixels, len);
 
-            // Process each zone independently with strength-map pipeline
-            for (int z = 0; z < zones.Count; z++)
+            // Phase 9: ゾーンをレイヤー順（昇順）でソートし、上位レイヤーが結果を上書き
+            var sortedZones = zones
+                .Where(z => z.enabled)
+                .OrderBy(z => z.layerIndex)
+                .ToList();
+
+            int currentLayer = -1;
+            Color32[] layerInputPixels = null;
+
+            foreach (var zone in sortedZones)
             {
-                var zone = zones[z];
-                if (!zone.enabled) continue;
+                // レイヤーが変わったら、前のレイヤー出力を次の入力として使用
+                if (zone.layerIndex != currentLayer)
+                {
+                    currentLayer = zone.layerIndex;
+                    layerInputPixels = new Color32[len];
+                    System.Array.Copy(pixels, layerInputPixels, len);
+                }
 
                 // 1. Build strength map using original pixel colors
                 float[] strength = new float[len];
@@ -559,11 +703,7 @@ namespace VRCAvatarColorChanger
                     strength[i] = zone.GetMatchStrength(originalPixels[i], x, y, w, h);
                 }
 
-                // 2. Median filter to remove isolated dot artifacts
-                if (cleanupRadius > 0)
-                    strength = MedianFilter(strength, w, h, cleanupRadius);
-
-                // 3. Gaussian blur for smooth edge transitions (constrained to edges)
+                // 2. Gaussian blur for smooth edge transitions (constrained to edges)
                 if (edgeFeather > 0.01f)
                 {
                     float[] preBlur = (float[])strength.Clone();
@@ -600,34 +740,6 @@ namespace VRCAvatarColorChanger
             }
 
             tex.SetPixels32(pixels);
-        }
-
-        private static float[] MedianFilter(float[] map, int w, int h, int radius)
-        {
-            float[] result = new float[map.Length];
-            int kernelSize = (2 * radius + 1) * (2 * radius + 1);
-            float[] neighborhood = new float[kernelSize];
-
-            for (int y = 0; y < h; y++)
-            {
-                for (int x = 0; x < w; x++)
-                {
-                    int ki = 0;
-                    for (int dy = -radius; dy <= radius; dy++)
-                    {
-                        for (int dx = -radius; dx <= radius; dx++)
-                        {
-                            int nx = Mathf.Clamp(x + dx, 0, w - 1);
-                            int ny = Mathf.Clamp(y + dy, 0, h - 1);
-                            neighborhood[ki++] = map[ny * w + nx];
-                        }
-                    }
-                    System.Array.Sort(neighborhood, 0, kernelSize);
-                    result[y * w + x] = neighborhood[kernelSize / 2];
-                }
-            }
-
-            return result;
         }
 
         private static float[] GaussianBlur(float[] map, int w, int h, float sigma)
@@ -901,10 +1013,358 @@ namespace VRCAvatarColorChanger
 
         private void OnDestroy()
         {
-            if (previewTexture != null)
-                DestroyImmediate(previewTexture);
-            if (maskOverlayTexture != null)
-                DestroyImmediate(maskOverlayTexture);
+            SaveMaskToSession();
+            if (previewTexture != null)    DestroyImmediate(previewTexture);
+            if (rawPreviewTexture != null) DestroyImmediate(rawPreviewTexture);
+            if (diffTexture != null)       DestroyImmediate(diffTexture);
+            if (maskOverlayTexture != null) DestroyImmediate(maskOverlayTexture);
+        }
+
+        // ───────────────────────── Phase 2: Diff texture ─────────────────────────
+
+        private void BuildDiffTexture(Texture2D before, Texture2D after)
+        {
+            if (before == null || after == null) return;
+            int w = before.width, h = before.height;
+            if (diffTexture == null || diffTexture.width != w || diffTexture.height != h)
+            {
+                if (diffTexture != null) DestroyImmediate(diffTexture);
+                diffTexture = new Texture2D(w, h, TextureFormat.RGBA32, false);
+            }
+
+            Color32[] a = before.GetPixels32();
+            Color32[] b = after.GetPixels32();
+            Color32[] d = new Color32[w * h];
+            var highlight = new Color32(255, 220, 0, 160);
+            var clear     = new Color32(0, 0, 0, 0);
+
+            for (int i = 0; i < d.Length; i++)
+            {
+                int diff = Mathf.Abs(a[i].r - b[i].r)
+                         + Mathf.Abs(a[i].g - b[i].g)
+                         + Mathf.Abs(a[i].b - b[i].b);
+                d[i] = diff > 10 ? highlight : clear;
+            }
+
+            diffTexture.SetPixels32(d);
+            diffTexture.Apply();
+        }
+
+        // ───────────────────────── Phase 3: Mask Undo ────────────────────────────
+
+        private void PushMaskUndo()
+        {
+            bool[] snapshot = exclusionMask != null ? (bool[])exclusionMask.Clone() : null;
+            _undoMaskHistory.Add(snapshot);
+            if (_undoMaskHistory.Count > UndoMaskLimit)
+                _undoMaskHistory.RemoveAt(0);
+        }
+
+        private void UndoMaskStep()
+        {
+            if (_undoMaskHistory.Count == 0) return;
+            exclusionMask = _undoMaskHistory[_undoMaskHistory.Count - 1];
+            _undoMaskHistory.RemoveAt(_undoMaskHistory.Count - 1);
+            maskDirty = true;
+            previewDirty = true;
+            Repaint();
+        }
+
+        // ───────────────────────── Phase 4: Mask Persistence ────────────────────
+
+        private string MaskSessionKey()
+        {
+            if (sourceTexture == null) return null;
+            string path = AssetDatabase.GetAssetPath(sourceTexture);
+            return string.IsNullOrEmpty(path) ? null : "VACC_Mask_" + path;
+        }
+
+        private void SaveMaskToSession()
+        {
+            string key = MaskSessionKey();
+            if (key == null) return;
+
+            if (exclusionMask == null || exclusionMask.Length == 0)
+            {
+                SessionState.EraseString(key);
+                return;
+            }
+
+            // Store dimensions + bitpacked mask
+            int len = exclusionMask.Length;
+            int byteLen = (len + 7) / 8;
+            byte[] packed = new byte[byteLen + 8]; // 4bytes W + 4bytes H + data
+
+            System.Buffer.BlockCopy(System.BitConverter.GetBytes(maskWidth),  0, packed, 0, 4);
+            System.Buffer.BlockCopy(System.BitConverter.GetBytes(maskHeight), 0, packed, 4, 4);
+
+            for (int i = 0; i < len; i++)
+            {
+                if (exclusionMask[i])
+                    packed[8 + i / 8] |= (byte)(1 << (i % 8));
+            }
+
+            SessionState.SetString(key, System.Convert.ToBase64String(packed));
+        }
+
+        private void RestoreMaskFromSession()
+        {
+            string key = MaskSessionKey();
+            if (key == null) return;
+
+            string encoded = SessionState.GetString(key, null);
+            if (string.IsNullOrEmpty(encoded)) return;
+
+            try
+            {
+                byte[] packed = System.Convert.FromBase64String(encoded);
+                if (packed.Length < 9) return;
+
+                int w = System.BitConverter.ToInt32(packed, 0);
+                int h = System.BitConverter.ToInt32(packed, 4);
+                if (w <= 0 || h <= 0) return;
+
+                int len = w * h;
+                bool[] mask = new bool[len];
+                for (int i = 0; i < len; i++)
+                    mask[i] = (packed[8 + i / 8] & (1 << (i % 8))) != 0;
+
+                maskWidth  = w;
+                maskHeight = h;
+                exclusionMask = mask;
+                maskDirty = true;
+            }
+            catch
+            {
+                // 破損データは無視
+                SessionState.EraseString(key);
+            }
+        }
+
+        // ───────────────────────── Phase 5: Presets ──────────────────────────────
+
+        private static string ProjectPresetFolder
+            => System.IO.Path.Combine(Application.dataPath, "VACCPresets");
+
+        private static string UserPresetFolder
+            => System.IO.Path.Combine(
+                System.Environment.GetFolderPath(System.Environment.SpecialFolder.ApplicationData),
+                "VACCPresets");
+
+        private string ActivePresetFolder
+            => presetStorageProject ? ProjectPresetFolder : UserPresetFolder;
+
+        private void DrawPresetsSection()
+        {
+            presetsFoldout = EditorGUILayout.BeginFoldoutHeaderGroup(presetsFoldout, Localization.Presets);
+            if (!presetsFoldout)
+            {
+                EditorGUILayout.EndFoldoutHeaderGroup();
+                return;
+            }
+
+            // 保存先切り替え
+            EditorGUILayout.BeginHorizontal();
+            if (GUILayout.Toggle(presetStorageProject, Localization.PresetStorageProject, EditorStyles.miniButtonLeft) && !presetStorageProject)
+                presetStorageProject = true;
+            if (GUILayout.Toggle(!presetStorageProject, Localization.PresetStorageUser, EditorStyles.miniButtonRight) && presetStorageProject)
+                presetStorageProject = false;
+            EditorGUILayout.EndHorizontal();
+
+            // 保存
+            EditorGUILayout.BeginHorizontal();
+            presetSaveName = EditorGUILayout.TextField(Localization.PresetName, presetSaveName);
+            if (GUILayout.Button(Localization.SavePreset, GUILayout.Width(48)))
+                SavePreset(presetSaveName);
+            EditorGUILayout.EndHorizontal();
+
+            // インポート / エクスポート
+            EditorGUILayout.BeginHorizontal();
+            if (GUILayout.Button(Localization.ExportJson))
+                ExportPresetJson();
+            if (GUILayout.Button(Localization.ImportJson))
+                ImportPresetJson();
+            EditorGUILayout.EndHorizontal();
+
+            // 一覧
+            string folder = ActivePresetFolder;
+            string[] files = System.IO.Directory.Exists(folder)
+                ? System.IO.Directory.GetFiles(folder, "*.json")
+                : System.Array.Empty<string>();
+
+            if (files.Length == 0)
+            {
+                EditorGUILayout.HelpBox(Localization.NoPresets, MessageType.None);
+            }
+            else
+            {
+                presetScrollPos = EditorGUILayout.BeginScrollView(presetScrollPos, GUILayout.MaxHeight(120));
+                foreach (string file in files)
+                {
+                    string pname = System.IO.Path.GetFileNameWithoutExtension(file);
+                    EditorGUILayout.BeginHorizontal();
+                    EditorGUILayout.LabelField(pname, GUILayout.ExpandWidth(true));
+                    if (GUILayout.Button(Localization.LoadPreset, GUILayout.Width(40)))
+                        LoadPreset(file);
+                    if (GUILayout.Button("×", GUILayout.Width(22)))
+                    {
+                        if (EditorUtility.DisplayDialog(Localization.Confirm,
+                            Localization.DeletePresetConfirm(pname), Localization.OK, Localization.Cancel))
+                        {
+                            System.IO.File.Delete(file);
+                            AssetDatabase.Refresh();
+                        }
+                    }
+                    EditorGUILayout.EndHorizontal();
+                }
+                EditorGUILayout.EndScrollView();
+            }
+
+            EditorGUILayout.EndFoldoutHeaderGroup();
+            EditorGUILayout.Space(4);
+        }
+
+        private void SavePreset(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) name = "Preset";
+            // ファイル名サニタイズ
+            foreach (char c in System.IO.Path.GetInvalidFileNameChars())
+                name = name.Replace(c.ToString(), "_");
+
+            string folder = ActivePresetFolder;
+            if (!System.IO.Directory.Exists(folder))
+                System.IO.Directory.CreateDirectory(folder);
+
+            var data = new VACCPresetData
+            {
+                name = name,
+                zones = new List<ColorZone>(zones),
+                edgeFeather = edgeFeather
+            };
+            string json = JsonUtility.ToJson(data, true);
+            string path = System.IO.Path.Combine(folder, name + ".json");
+            System.IO.File.WriteAllText(path, json);
+            if (presetStorageProject) AssetDatabase.Refresh();
+        }
+
+        private void LoadPreset(string filePath)
+        {
+            if (!System.IO.File.Exists(filePath)) return;
+            string json = System.IO.File.ReadAllText(filePath);
+            var data = JsonUtility.FromJson<VACCPresetData>(json);
+            if (data == null) return;
+
+            zones = data.zones ?? new List<ColorZone>();
+            edgeFeather = data.edgeFeather;
+            previewDirty = true;
+        }
+
+        private void ExportPresetJson()
+        {
+            string path = EditorUtility.SaveFilePanel(
+                Localization.ExportJson, "", "VACC_preset", "json");
+            if (string.IsNullOrEmpty(path)) return;
+            SavePresetToPath(path);
+        }
+
+        private void ImportPresetJson()
+        {
+            string path = EditorUtility.OpenFilePanel(
+                Localization.ImportJson, "", "json");
+            if (string.IsNullOrEmpty(path)) return;
+            LoadPreset(path);
+        }
+
+        private void SavePresetToPath(string path)
+        {
+            var data = new VACCPresetData
+            {
+                name = System.IO.Path.GetFileNameWithoutExtension(path),
+                zones = new List<ColorZone>(zones),
+                edgeFeather = edgeFeather
+            };
+            System.IO.File.WriteAllText(path, JsonUtility.ToJson(data, true));
+        }
+
+        // ───────────────────────── Phase 8: Batch Apply ──────────────────────────
+
+        private void DrawBatchSection()
+        {
+            batchFoldout = EditorGUILayout.BeginFoldoutHeaderGroup(batchFoldout, Localization.BatchApply);
+            if (!batchFoldout)
+            {
+                EditorGUILayout.EndFoldoutHeaderGroup();
+                return;
+            }
+
+            EditorGUILayout.HelpBox(Localization.BatchHint, MessageType.Info);
+
+            // テクスチャ一覧
+            batchScrollPos = EditorGUILayout.BeginScrollView(batchScrollPos, GUILayout.MaxHeight(120));
+            int removeIdx = -1;
+            for (int i = 0; i < batchTextures.Count; i++)
+            {
+                EditorGUILayout.BeginHorizontal();
+                batchTextures[i] = (Texture2D)EditorGUILayout.ObjectField(
+                    batchTextures[i], typeof(Texture2D), false);
+                if (GUILayout.Button("×", GUILayout.Width(22)))
+                    removeIdx = i;
+                EditorGUILayout.EndHorizontal();
+            }
+            EditorGUILayout.EndScrollView();
+
+            if (removeIdx >= 0) batchTextures.RemoveAt(removeIdx);
+
+            if (GUILayout.Button(Localization.AddBatchTexture))
+                batchTextures.Add(null);
+
+            EditorGUI.BeginDisabledGroup(batchTextures.Count == 0 || zones.Count == 0);
+            if (GUILayout.Button(Localization.BatchApplyAndSave, GUILayout.Height(28)))
+                RunBatchApply();
+            EditorGUI.EndDisabledGroup();
+
+            EditorGUILayout.EndFoldoutHeaderGroup();
+            EditorGUILayout.Space(4);
+        }
+
+        private void RunBatchApply()
+        {
+            int success = 0;
+            for (int i = 0; i < batchTextures.Count; i++)
+            {
+                var tex = batchTextures[i];
+                if (tex == null) continue;
+
+                EditorUtility.DisplayProgressBar(
+                    Localization.BatchProgress,
+                    tex.name,
+                    (float)i / batchTextures.Count);
+
+                if (!IsReadable(tex)) EnableReadWrite(tex);
+                if (!IsReadable(tex)) continue;
+
+                string srcPath = AssetDatabase.GetAssetPath(tex);
+                if (string.IsNullOrEmpty(srcPath)) continue;
+
+                byte[] srcBytes = System.IO.File.ReadAllBytes(srcPath);
+                var fullTex = new Texture2D(2, 2, TextureFormat.RGBA32, false);
+                if (!fullTex.LoadImage(srcBytes)) { DestroyImmediate(fullTex); continue; }
+
+                ProcessPixels(fullTex);
+                fullTex.Apply();
+                byte[] pngData = fullTex.EncodeToPNG();
+                DestroyImmediate(fullTex);
+
+                string dir      = System.IO.Path.GetDirectoryName(srcPath);
+                string baseName = System.IO.Path.GetFileNameWithoutExtension(srcPath) + "_recolored";
+                string outPath  = System.IO.Path.Combine(dir, baseName + ".png");
+                System.IO.File.WriteAllBytes(outPath, pngData);
+                success++;
+            }
+
+            EditorUtility.ClearProgressBar();
+            AssetDatabase.Refresh();
+            EditorUtility.DisplayDialog(Localization.Complete, Localization.BatchComplete(success), Localization.OK);
         }
     }
 }
