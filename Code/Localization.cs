@@ -151,6 +151,11 @@ namespace VRCAvatarColorChanger
             ? $"プリセット「{name}」を削除しますか？"
             : $"Delete preset '{name}'?";
 
+        // ─── Preset Tips ───
+        public static string PresetTips => IsJapanese
+            ? "【ヒント】\n保存: 現在のゾーン設定をプリセットとして保存\n読込: プリセットを読み込みゾーン設定を上書き\n×: プリセットを削除\n\n保存先\n・プロジェクト内 … Assets フォルダ内に保存 (Gitなどで共有可)\n・ユーザー共通 … 全プロジェクトで共有 (端末ローカルに保存)\n\nJSON エクスポート/インポートで設定を外部ファイルとして共有できます"
+            : "[Tips]\nSave: Save current zone settings as a preset\nLoad: Overwrite zone settings with a preset\n×: Delete a preset\n\nStorage\n· In Project … Saved inside Assets folder (shareable via Git)\n· Shared (User) … Shared across all projects (machine-local)\n\nUse Export/Import JSON to share settings as a file";
+
         // ─── Batch apply ───
         public static string BatchApply        => IsJapanese ? "一括適用" : "Batch Apply";
         public static string BatchHint         => IsJapanese

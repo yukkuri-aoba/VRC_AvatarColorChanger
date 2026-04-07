@@ -297,6 +297,7 @@ namespace VRCAvatarColorChanger
             {
                 PushMaskUndo();
                 exclusionMask = null;
+                maskDirty = true;
                 previewDirty = true;
             }
 
@@ -481,7 +482,21 @@ namespace VRCAvatarColorChanger
                 case EventType.ScrollWheel:
                     if (isInRect && e.control)
                     {
-                        previewZoom = Mathf.Clamp(previewZoom - e.delta.y * 0.05f, 0.25f, 4f);
+                        float oldZoom = previewZoom;
+                        // 乗算的ズーム: スクロール1ノッチ(delta≈3)で約10%変化、自然な加速感
+                        float newZoom = Mathf.Clamp(oldZoom * Mathf.Pow(1.1f, -e.delta.y / 3f), 0.25f, 4f);
+
+                        // マウス位置を起点にスクロールオフセットを補正
+                        if (previewTexture != null && Mathf.Abs(newZoom - oldZoom) > 0.0001f)
+                        {
+                            // previewRect との差 = 画像左上からのディスプレイピクセル距離
+                            Vector2 mouseInImage = e.mousePosition - new Vector2(previewRect.x, previewRect.y);
+                            previewScrollPos += mouseInImage * (newZoom / oldZoom - 1f);
+                            previewScrollPos.x = Mathf.Max(0f, previewScrollPos.x);
+                            previewScrollPos.y = Mathf.Max(0f, previewScrollPos.y);
+                        }
+
+                        previewZoom = newZoom;
                         e.Use();
                         Repaint();
                     }
@@ -1162,6 +1177,8 @@ namespace VRCAvatarColorChanger
                 EditorGUILayout.EndFoldoutHeaderGroup();
                 return;
             }
+
+            EditorGUILayout.HelpBox(Localization.PresetTips, MessageType.Info);
 
             // 保存先切り替え
             EditorGUILayout.BeginHorizontal();
